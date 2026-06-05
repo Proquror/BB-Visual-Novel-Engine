@@ -713,7 +713,7 @@ export function setupExtensionSettings() {
             const result = importActivePersonaSnapshot(raw);
             saveChatDebounced();
             recalculateAllStats(false);
-            notifySuccess(`Snapshot импортирован: ${result.characters} персонажей. Старые события до точки импорта больше не наслаиваются повторно.`);
+            notifySuccess(`Snapshot импортирован: ${result.characters} персонажей.${result.hasRawUpdates ? ' Сырые данные восстановлены, полный пересчёт от начала чата.' : ' Старые события до точки импорта больше не наслаиваются повторно.'}`);
         } catch (error) {
             console.error('[BB VN] Snapshot import failed:', error);
             notifyError("Не удалось импортировать snapshot. Проверьте JSON-файл.");

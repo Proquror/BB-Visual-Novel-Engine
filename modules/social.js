@@ -1133,8 +1133,25 @@ export function exportActivePersonaSnapshot() {
         characters[charName] = normalizeImportedCharacterStats(stats);
     });
 
+    const rawMessageUpdates = {};
+    chat.forEach((msg, idx) => {
+        if (!msg?.extra) return;
+        const entry = {};
+        if (msg.extra.bb_social_swipes && typeof msg.extra.bb_social_swipes === 'object'
+            && Object.keys(msg.extra.bb_social_swipes).length > 0) {
+            entry.bb_social_swipes = cloneJsonData(msg.extra.bb_social_swipes, {});
+        }
+        if (msg.extra.bb_vn_char_traits_swipes && typeof msg.extra.bb_vn_char_traits_swipes === 'object'
+            && Object.keys(msg.extra.bb_vn_char_traits_swipes).length > 0) {
+            entry.bb_vn_char_traits_swipes = cloneJsonData(msg.extra.bb_vn_char_traits_swipes, {});
+        }
+        if (Object.keys(entry).length > 0) {
+            rawMessageUpdates[idx] = entry;
+        }
+    });
+
     return {
-        schema_version: 1,
+        schema_version: 2,
         module: MODULE_NAME,
         exported_at: new Date().toISOString(),
         scope_key: scopeKey,
@@ -1150,6 +1167,7 @@ export function exportActivePersonaSnapshot() {
             global_log: cloneJsonData(chat_metadata['bb_vn_global_log'], []),
             story_moments: cloneJsonData(currentStoryMoments, []),
             characters,
+            raw_message_updates: rawMessageUpdates,
         },
     };
 }
@@ -1160,7 +1178,7 @@ export function importActivePersonaSnapshot(rawSnapshot = '') {
     if (!snapshotData || typeof snapshotData !== 'object') throw new Error('INVALID_SNAPSHOT');
     if (!snapshotData.characters || typeof snapshotData.characters !== 'object') throw new Error('INVALID_SNAPSHOT_CHARACTERS');
 
-    const { scopeState } = bindActivePersonaState();
+    const { scopeKey, scopeState } = bindActivePersonaState();
     const chat = SillyTavern.getContext().chat || [];
     const normalizedCharacters = {};
     Object.entries(snapshotData.characters).forEach(([charName, stats]) => {
@@ -1178,6 +1196,8 @@ export function importActivePersonaSnapshot(rawSnapshot = '') {
         merge_suggestions: cloneJsonData(scopeState.merge_suggestions, []),
         global_log: cloneJsonData(scopeState.global_log, []),
         log_cutoff_index: parseInt(scopeState.log_cutoff_index, 10) || 0,
+        snapshot_baseline: cloneJsonData(scopeState.snapshot_baseline, null),
+        snapshot_cutoff_index: parseInt(scopeState.snapshot_cutoff_index, 10) || 0,
     };
 
     scopeState.char_bases = cloneJsonData(snapshotData.char_bases, {});
@@ -1186,21 +1206,127 @@ export function importActivePersonaSnapshot(rawSnapshot = '') {
     scopeState.platonic_chars = cloneJsonData(snapshotData.platonic_chars, []);
     scopeState.char_registry = cloneJsonData(snapshotData.char_registry, {});
     scopeState.merge_suggestions = cloneJsonData(snapshotData.merge_suggestions, []);
-    scopeState.snapshot_baseline = {
-        characters: normalizedCharacters,
-        global_log: cloneJsonData(snapshotData.global_log, []),
-        story_moments: cloneJsonData(snapshotData.story_moments, []),
-        char_bases: cloneJsonData(snapshotData.char_bases, {}),
-        char_bases_romance: cloneJsonData(snapshotData.char_bases_romance, {}),
-    };
-    scopeState.snapshot_cutoff_index = Array.isArray(chat) ? chat.length : 0;
-    scopeState.log_cutoff_index = Array.isArray(chat) ? chat.length : 0;
+
+    const hasRawMessageUpdates = snapshotData.raw_message_updates
+        && typeof snapshotData.raw_message_updates === 'object'
+        && Object.keys(snapshotData.raw_message_updates).length > 0;
+
+    console.warn('[BB VN][IMPORT] schema_version=' + parsedSnapshot?.schema_version +
+        ' scopeKey=' + scopeKey +
+        ' snapshotScope=' + (parsedSnapshot?.scope_key || '') +
+        ' hasRawUpdates=' + hasRawMessageUpdates +
+        ' rawMsgCount=' + (snapshotData.raw_message_updates ? Object.keys(snapshotData.raw_message_updates).length : 0) +
+        ' chatLength=' + chat.length);
+
+    if (hasRawMessageUpdates) {
+        const snapshotScopeKey = String(parsedSnapshot?.scope_key || '').trim();
+        const currentBinding = ensurePersonaBindingsStore()?.[getCurrentPersonaIdentity()?.ref || ''];
+        const allScopeAliases = new Set([
+            scopeKey,
+            snapshotScopeKey,
+            ...(Array.isArray(currentBinding?.aliases) ? currentBinding.aliases : []),
+        ].filter(Boolean));
+
+        let restoreWritten = 0;
+        let restoreSkipped = 0;
+
+        Object.entries(snapshotData.raw_message_updates).forEach(([idxStr, msgUpdates]) => {
+            const msgIdx = parseInt(idxStr, 10);
+            if (Number.isNaN(msgIdx) || msgIdx < 0 || msgIdx >= chat.length) return;
+            const msg = chat[msgIdx];
+            if (!msg) return;
+            if (!msg.extra) msg.extra = {};
+
+            if (msgUpdates.bb_social_swipes && typeof msgUpdates.bb_social_swipes === 'object') {
+                if (!msg.extra.bb_social_swipes) msg.extra.bb_social_swipes = {};
+                Object.entries(msgUpdates.bb_social_swipes).forEach(([swipeId, updates]) => {
+                    if (!Array.isArray(updates)) return;
+                    const existingEntries = msg.extra.bb_social_swipes[swipeId];
+                    const existingIsEmpty = !Array.isArray(existingEntries) || existingEntries.length === 0;
+                    if (!existingIsEmpty) {
+                        restoreSkipped++;
+                        return;
+                    }
+                    msg.extra.bb_social_swipes[swipeId] = updates.map(update => {
+                        if (!update || typeof update !== 'object') return update;
+                        const originalScope = String(update.scope || '').trim();
+                        if (originalScope && allScopeAliases.has(originalScope)) {
+                            return { ...update, scope: scopeKey };
+                        }
+                        if (!originalScope) {
+                            return { ...update, scope: scopeKey };
+                        }
+                        return update;
+                    });
+                    restoreWritten++;
+                });
+            }
+
+            if (msgUpdates.bb_vn_char_traits_swipes && typeof msgUpdates.bb_vn_char_traits_swipes === 'object') {
+                if (!msg.extra.bb_vn_char_traits_swipes) msg.extra.bb_vn_char_traits_swipes = {};
+                Object.entries(msgUpdates.bb_vn_char_traits_swipes).forEach(([swipeId, traits]) => {
+                    if (!Array.isArray(traits)) return;
+                    const existingEntries = msg.extra.bb_vn_char_traits_swipes[swipeId];
+                    const existingIsEmpty = !Array.isArray(existingEntries) || existingEntries.length === 0;
+                    if (!existingIsEmpty) return;
+                    msg.extra.bb_vn_char_traits_swipes[swipeId] = traits.map(trait => {
+                        if (!trait || typeof trait !== 'object') return trait;
+                        const originalScope = String(trait.scope || '').trim();
+                        if (originalScope && allScopeAliases.has(originalScope)) {
+                            return { ...trait, scope: scopeKey };
+                        }
+                        if (!originalScope) {
+                            return { ...trait, scope: scopeKey };
+                        }
+                        return trait;
+                    });
+                });
+            }
+        });
+
+        console.warn('[BB VN][IMPORT] raw restore: written=' + restoreWritten + ' skipped=' + restoreSkipped);
+    }
+
+    if (hasRawMessageUpdates) {
+        scopeState.snapshot_baseline = {
+            characters: {},
+            global_log: cloneJsonData(snapshotData.global_log, []),
+            story_moments: cloneJsonData(snapshotData.story_moments, []),
+            char_bases: {},
+            char_bases_romance: {},
+        };
+        scopeState.snapshot_cutoff_index = 0;
+        scopeState.log_cutoff_index = 0;
+    } else {
+        scopeState.snapshot_baseline = {
+            characters: normalizedCharacters,
+            global_log: cloneJsonData(snapshotData.global_log, []),
+            story_moments: cloneJsonData(snapshotData.story_moments, []),
+            char_bases: cloneJsonData(snapshotData.char_bases, {}),
+            char_bases_romance: cloneJsonData(snapshotData.char_bases_romance, {}),
+        };
+        scopeState.snapshot_cutoff_index = Array.isArray(chat) ? chat.length : 0;
+        scopeState.log_cutoff_index = Array.isArray(chat) ? chat.length : 0;
+    }
+
     if (parsedSnapshot?.persona_label) scopeState.label = String(parsedSnapshot.persona_label);
+
+    const identity = getCurrentPersonaIdentity();
+    const identityRef = identity?.ref || `legacy:${getLegacyPersonaTextScopeKey()}`;
+    const bindings = ensurePersonaBindingsStore();
+    bindings[identityRef] = {
+        scope_key: scopeKey,
+        aliases: Array.isArray(bindings[identityRef]?.aliases) ? bindings[identityRef].aliases : [],
+        persona_name: identity?.name || '',
+        persona_avatar: identity?.avatarRef || '',
+        updated_at: Date.now(),
+    };
 
     bindActivePersonaState();
     return {
         characters: Object.keys(normalizedCharacters).length,
         cutoffIndex: scopeState.snapshot_cutoff_index,
+        hasRawUpdates: hasRawMessageUpdates,
     };
 }
 
@@ -1220,6 +1346,10 @@ export function clearActivePersonaSnapshot() {
         scopeState.merge_suggestions = cloneJsonData(restoreState.merge_suggestions, []);
         scopeState.global_log = cloneJsonData(restoreState.global_log, []);
         scopeState.log_cutoff_index = parseInt(restoreState.log_cutoff_index, 10) || 0;
+        if (restoreState.snapshot_baseline && typeof restoreState.snapshot_baseline === 'object') {
+            scopeState.snapshot_baseline = cloneJsonData(restoreState.snapshot_baseline, null);
+            scopeState.snapshot_cutoff_index = parseInt(restoreState.snapshot_cutoff_index, 10) || 0;
+        }
     }
 
     scopeState.snapshot_baseline = null;
@@ -2465,6 +2595,13 @@ export function recalculateAllStats(isNewMessage = false) {
     let needsSave = purgeUserPersonaTracking(scopeState);
     setCurrentCalculatedStats(newStats);
     currentStoryMoments.length = 0;
+
+    const statsCutoffIndexDebug = Math.min(parseInt(scopeState.snapshot_cutoff_index, 10) || 0, (SillyTavern.getContext().chat || []).length);
+    console.warn('[BB VN][RECALC] scopeKey=' + scopeKey +
+        ' aliasSet=[' + [...aliasSet].join(',') + ']' +
+        ' cutoff=' + statsCutoffIndexDebug +
+        ' hasBaseline=' + !!scopeState.snapshot_baseline +
+        ' baselineChars=' + (scopeState.snapshot_baseline?.characters ? Object.keys(scopeState.snapshot_baseline.characters).length : 0));
     const snapshotBaseline = scopeState.snapshot_baseline && typeof scopeState.snapshot_baseline === 'object'
         ? scopeState.snapshot_baseline
         : null;
@@ -2885,6 +3022,11 @@ export function recalculateAllStats(isNewMessage = false) {
 
     saveActivePersonaCutoff();
     if (needsSave) saveChatDebounced();
+
+    console.warn('[BB VN][RECALC] result: chars=' + Object.keys(newStats).length +
+        ' names=[' + Object.keys(newStats).join(',') + ']' +
+        ' needsSave=' + needsSave);
+
     injectCombinedSocialPrompt();
     renderHudCallback();
     if (typeof window['bbRenderMergeSuggestionsList'] === 'function') {
